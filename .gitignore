@@ -21,3 +21,6 @@ go.work.sum
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Local demo vault
+vault/
