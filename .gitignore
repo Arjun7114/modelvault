@@ -24,3 +24,6 @@ Thumbs.db
 
 # Local demo vault
 vault/
+
+# Restore demo output
+restored_*

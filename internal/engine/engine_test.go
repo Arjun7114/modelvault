@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -65,5 +66,30 @@ func TestBackup_AcrossTwoRuns(t *testing.T) {
 	}
 	if s2.DupChunks != 2 {
 		t.Errorf("second run DupChunks = %d, want 2", s2.DupChunks)
+	}
+}
+func TestBackupRestore_RoundTrip(t *testing.T) {
+	be, err := backend.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	eng := engine.New(chunker.NewFixed(4), be)
+
+	original := "the quick brown fox jumps over the lazy dog"
+	snap, _, err := eng.Backup("doc", strings.NewReader(original))
+	if err != nil {
+		t.Fatalf("Backup: %v", err)
+	}
+
+	var buf bytes.Buffer
+	stats, err := eng.Restore(snap.ID, &buf)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if buf.String() != original {
+		t.Errorf("restored = %q, want %q", buf.String(), original)
+	}
+	if stats.Bytes != int64(len(original)) {
+		t.Errorf("restored %d bytes, want %d", stats.Bytes, len(original))
 	}
 }

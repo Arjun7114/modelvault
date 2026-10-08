@@ -105,3 +105,46 @@ func newSnapshotID() (string, error) {
 	ts := time.Now().UTC().Format("20060102T150405Z")
 	return fmt.Sprintf("%s-%s", ts, hex.EncodeToString(b[:])), nil
 }
+// RestoreStats summarizes a restore.
+type RestoreStats struct {
+	Chunks int
+	Bytes  int64
+}
+
+// Restore reads the snapshot with the given id and writes its reconstructed
+// contents to w, in chunk order. Every chunk is re-hashed and checked against
+// its stored address before being written, so corruption is caught on read.
+func (e *Engine) Restore(snapshotID string, w io.Writer) (RestoreStats, error) {
+	var stats RestoreStats
+
+	data, err := e.backend.GetSnapshot(snapshotID)
+	if err != nil {
+		return stats, fmt.Errorf("reading snapshot: %w", err)
+	}
+	var snap snapshot.Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return stats, fmt.Errorf("parsing snapshot: %w", err)
+	}
+
+	for i, hash := range snap.Chunks {
+		chunk, err := e.backend.GetChunk(hash)
+		if err != nil {
+			return stats, fmt.Errorf("reading chunk %d (%s): %w", i, hash, err)
+		}
+		// Integrity: the bytes must still hash to their own address.
+		sum := sha256.Sum256(chunk)
+		if got := hex.EncodeToString(sum[:]); got != hash {
+			return stats, fmt.Errorf("integrity error on chunk %d: want %s, got %s", i, hash, got)
+		}
+		if _, err := w.Write(chunk); err != nil {
+			return stats, fmt.Errorf("writing chunk %d: %w", i, err)
+		}
+		stats.Chunks++
+		stats.Bytes += int64(len(chunk))
+	}
+
+	if stats.Bytes != snap.Size {
+		return stats, fmt.Errorf("size mismatch: snapshot says %d bytes, restored %d", snap.Size, stats.Bytes)
+	}
+	return stats, nil
+}
