@@ -404,3 +404,7 @@ func (e *Engine) RestoreConcurrent(ctx context.Context, snapshotID string, w io.
 	}
 	return stats, nil
 }
+// ListSnapshots returns the ids of all snapshots in the backend.
+func (e *Engine) ListSnapshots(ctx context.Context) ([]string, error) {
+	return e.backend.ListSnapshots(ctx)
+}

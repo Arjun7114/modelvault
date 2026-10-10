@@ -4,10 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"time"
 
+	"github.com/Arjun7114/modelvault/internal/api"
 	"github.com/Arjun7114/modelvault/internal/backend"
 	"github.com/Arjun7114/modelvault/internal/chunker"
 	"github.com/Arjun7114/modelvault/internal/engine"
@@ -35,6 +38,10 @@ func main() {
 		if err := runRestore(ctx, os.Args[2:]); err != nil {
 			fail(err)
 		}
+	case "serve":
+		if err := runServe(ctx, os.Args[2:]); err != nil {
+			fail(err)
+		}
 	default:
 		usage()
 		os.Exit(2)
@@ -52,12 +59,11 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  modelvault backup  [--backend local|s3|azure] [--vault DIR] [--bucket NAME] [--region R] [--container NAME] [--chunker fixed|cdc] [--chunk-size N] <file>")
 	fmt.Fprintln(os.Stderr, "  modelvault list    [--backend local|s3|azure] [--vault DIR] [--bucket NAME] [--region R] [--container NAME]")
 	fmt.Fprintln(os.Stderr, "  modelvault restore [--backend local|s3|azure] [--vault DIR] [--bucket NAME] [--region R] [--container NAME] --out FILE <snapshot-id>")
+	fmt.Fprintln(os.Stderr, "  modelvault serve   [--addr :8080] [--backend local|s3|azure] [--vault DIR] [--bucket NAME] [--region R] [--container NAME] [--chunk-size N]")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "azure backend reads the connection string from AZURE_STORAGE_CONNECTION_STRING.")
 }
 
-// buildBackend constructs the chosen storage backend. Three cloud/local options,
-// one interface — the engine never changes.
 func buildBackend(ctx context.Context, kind, vault, bucket, region, container string) (backend.Backend, error) {
 	switch kind {
 	case "local":
@@ -104,7 +110,6 @@ func log2Floor(n int) int {
 	return bits
 }
 
-// addBackendFlags registers the backend-selection flags shared by all commands.
 func addBackendFlags(fs *flag.FlagSet) (kind, vault, bucket, region, container *string) {
 	kind = fs.String("backend", "local", "storage backend: local, s3, or azure")
 	vault = fs.String("vault", "vault", "path to the vault directory (local backend)")
@@ -217,4 +222,44 @@ func runRestore(ctx context.Context, args []string) error {
 	fmt.Printf("restored snapshot %s -> %q (backend: %s)\n", snapshotID, *out, *kind)
 	fmt.Printf("  chunks: %d (%d bytes)\n", stats.Chunks, stats.Bytes)
 	return nil
+}
+
+func runServe(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	kind, vault, bucket, region, container := addBackendFlags(fs)
+	addr := fs.String("addr", ":8080", "listen address")
+	chunkSize := fs.Int("chunk-size", 4096, "chunk size in bytes")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	be, err := buildBackend(ctx, *kind, *vault, *bucket, *region, *container)
+	if err != nil {
+		return err
+	}
+	eng := engine.New(chunker.NewFixed(*chunkSize), be)
+
+	srv := &http.Server{
+		Addr:    *addr,
+		Handler: api.NewServer(eng).Routes(),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		fmt.Printf("modelvault serving on %s (backend: %s)\n", *addr, *kind)
+		errCh <- srv.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		fmt.Println("\nshutting down...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	case err := <-errCh:
+		if err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("server: %w", err)
+		}
+		return nil
+	}
 }
