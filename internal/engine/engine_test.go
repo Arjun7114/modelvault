@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -11,14 +12,14 @@ import (
 )
 
 func TestBackup_DeduplicatesRepeatedChunks(t *testing.T) {
+	ctx := context.Background()
 	be, err := backend.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocal: %v", err)
 	}
 	eng := engine.New(chunker.NewFixed(4), be)
 
-	// "AAAABBBBAAAA" at size 4 -> AAAA, BBBB, AAAA: 3 chunks, 2 unique.
-	snap, stats, err := eng.Backup("test", strings.NewReader("AAAABBBBAAAA"))
+	snap, stats, err := eng.Backup(ctx, "test", strings.NewReader("AAAABBBBAAAA"))
 	if err != nil {
 		t.Fatalf("Backup: %v", err)
 	}
@@ -35,20 +36,20 @@ func TestBackup_DeduplicatesRepeatedChunks(t *testing.T) {
 	if len(snap.Chunks) != 3 {
 		t.Errorf("snapshot has %d chunk refs, want 3", len(snap.Chunks))
 	}
-	if _, err := be.GetSnapshot(snap.ID); err != nil {
+	if _, err := be.GetSnapshot(ctx, snap.ID); err != nil {
 		t.Errorf("GetSnapshot(%q): %v", snap.ID, err)
 	}
 }
 
 func TestBackup_AcrossTwoRuns(t *testing.T) {
+	ctx := context.Background()
 	be, err := backend.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocal: %v", err)
 	}
 	eng := engine.New(chunker.NewFixed(4), be)
 
-	// First backup: everything is new.
-	_, s1, err := eng.Backup("v1", strings.NewReader("AAAABBBB"))
+	_, s1, err := eng.Backup(ctx, "v1", strings.NewReader("AAAABBBB"))
 	if err != nil {
 		t.Fatalf("first Backup: %v", err)
 	}
@@ -56,8 +57,7 @@ func TestBackup_AcrossTwoRuns(t *testing.T) {
 		t.Errorf("first run NewChunks = %d, want 2", s1.NewChunks)
 	}
 
-	// Second backup of the SAME data: everything is a duplicate, nothing new.
-	_, s2, err := eng.Backup("v2", strings.NewReader("AAAABBBB"))
+	_, s2, err := eng.Backup(ctx, "v2", strings.NewReader("AAAABBBB"))
 	if err != nil {
 		t.Fatalf("second Backup: %v", err)
 	}
@@ -68,7 +68,9 @@ func TestBackup_AcrossTwoRuns(t *testing.T) {
 		t.Errorf("second run DupChunks = %d, want 2", s2.DupChunks)
 	}
 }
+
 func TestBackupRestore_RoundTrip(t *testing.T) {
+	ctx := context.Background()
 	be, err := backend.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocal: %v", err)
@@ -76,13 +78,13 @@ func TestBackupRestore_RoundTrip(t *testing.T) {
 	eng := engine.New(chunker.NewFixed(4), be)
 
 	original := "the quick brown fox jumps over the lazy dog"
-	snap, _, err := eng.Backup("doc", strings.NewReader(original))
+	snap, _, err := eng.Backup(ctx, "doc", strings.NewReader(original))
 	if err != nil {
 		t.Fatalf("Backup: %v", err)
 	}
 
 	var buf bytes.Buffer
-	stats, err := eng.Restore(snap.ID, &buf)
+	stats, err := eng.Restore(ctx, snap.ID, &buf)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 
 	"github.com/Arjun7114/modelvault/internal/backend"
@@ -16,17 +18,23 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+
+	// Ctrl+C cancels the context, which propagates all the way down to the
+	// in-flight storage operations.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
 	switch os.Args[1] {
 	case "backup":
-		if err := runBackup(os.Args[2:]); err != nil {
+		if err := runBackup(ctx, os.Args[2:]); err != nil {
 			fail(err)
 		}
 	case "list":
-		if err := runList(os.Args[2:]); err != nil {
+		if err := runList(ctx, os.Args[2:]); err != nil {
 			fail(err)
 		}
 	case "restore":
-		if err := runRestore(os.Args[2:]); err != nil {
+		if err := runRestore(ctx, os.Args[2:]); err != nil {
 			fail(err)
 		}
 	default:
@@ -48,9 +56,6 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  modelvault restore [--vault DIR] --out FILE <snapshot-id>")
 }
 
-// buildChunker constructs the chosen chunking strategy. For cdc, chunk-size
-// seeds the parameters: average target 2^floor(log2(size)), min = size/4,
-// max = size*4 — so "fixed" and "cdc" at the same --chunk-size are comparable.
 func buildChunker(kind string, chunkSize int) (chunker.Chunker, error) {
 	switch kind {
 	case "fixed":
@@ -71,7 +76,6 @@ func buildChunker(kind string, chunkSize int) (chunker.Chunker, error) {
 	}
 }
 
-// log2Floor returns the position of the highest set bit (floor of log2).
 func log2Floor(n int) int {
 	bits := 0
 	for n > 1 {
@@ -81,7 +85,7 @@ func log2Floor(n int) int {
 	return bits
 }
 
-func runBackup(args []string) error {
+func runBackup(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("backup", flag.ExitOnError)
 	vault := fs.String("vault", "vault", "path to the vault directory")
 	chunkerKind := fs.String("chunker", "fixed", "chunking strategy: fixed or cdc")
@@ -111,7 +115,7 @@ func runBackup(args []string) error {
 	}
 	eng := engine.New(ck, be)
 
-	snap, stats, err := eng.Backup(filepath.Clean(srcPath), f)
+	snap, stats, err := eng.Backup(ctx, filepath.Clean(srcPath), f)
 	if err != nil {
 		return err
 	}
@@ -124,7 +128,7 @@ func runBackup(args []string) error {
 	return nil
 }
 
-func runList(args []string) error {
+func runList(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	vault := fs.String("vault", "vault", "path to the vault directory")
 	if err := fs.Parse(args); err != nil {
@@ -134,7 +138,7 @@ func runList(args []string) error {
 	if err != nil {
 		return fmt.Errorf("opening vault: %w", err)
 	}
-	ids, err := be.ListSnapshots()
+	ids, err := be.ListSnapshots(ctx)
 	if err != nil {
 		return err
 	}
@@ -148,7 +152,7 @@ func runList(args []string) error {
 	return nil
 }
 
-func runRestore(args []string) error {
+func runRestore(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
 	vault := fs.String("vault", "vault", "path to the vault directory")
 	out := fs.String("out", "", "output file path (required)")
@@ -175,7 +179,7 @@ func runRestore(args []string) error {
 	}
 	defer f.Close()
 
-	stats, err := eng.Restore(snapshotID, f)
+	stats, err := eng.Restore(ctx, snapshotID, f)
 	if err != nil {
 		return err
 	}

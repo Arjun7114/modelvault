@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -15,13 +16,11 @@ import (
 //	<root>/snapshots/<id>.json  one manifest per backup
 //
 // It's the development backend: no network, trivial to inspect by hand. The
-// S3 and Azure backends in Phase 4 implement this same interface.
+// S3 and Azure Blob backends implement this same interface.
 type LocalBackend struct {
 	root string
 }
 
-// Compile-time proof that *LocalBackend satisfies the Backend interface.
-// If a method signature ever drifts, the build breaks here, not at the call site.
 var _ Backend = (*LocalBackend)(nil)
 
 // NewLocal creates the directory layout under root (if needed) and returns a
@@ -35,9 +34,7 @@ func NewLocal(root string) (*LocalBackend, error) {
 	return &LocalBackend{root: root}, nil
 }
 
-// safeKey rejects keys that could escape the intended directory (path
-// traversal). Hashes and snapshot ids are simple tokens; anything with a
-// separator or ".." is refused.
+// safeKey rejects keys that could escape the intended directory.
 func safeKey(key string) error {
 	if key == "" || strings.ContainsAny(key, `/\`) || strings.Contains(key, "..") {
 		return fmt.Errorf("backend: unsafe key %q", key)
@@ -54,8 +51,7 @@ func (b *LocalBackend) snapshotPath(id string) string {
 }
 
 // writeFileAtomic writes to a temp file in the same directory, then renames it
-// into place. The rename is atomic, so a reader never sees a half-written file
-// even if the process dies mid-write.
+// into place. The rename is atomic, so a reader never sees a half-written file.
 func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
@@ -63,7 +59,7 @@ func writeFileAtomic(path string, data []byte) error {
 		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // best-effort cleanup if we fail below
+	defer os.Remove(tmpName)
 
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
@@ -75,9 +71,10 @@ func writeFileAtomic(path string, data []byte) error {
 	return os.Rename(tmpName, path)
 }
 
-// PutChunk stores data under hash. If the chunk already exists it's a no-op —
-// this is where de-duplication physically happens.
-func (b *LocalBackend) PutChunk(hash string, data []byte) error {
+func (b *LocalBackend) PutChunk(ctx context.Context, hash string, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := safeKey(hash); err != nil {
 		return err
 	}
@@ -90,8 +87,10 @@ func (b *LocalBackend) PutChunk(hash string, data []byte) error {
 	return writeFileAtomic(path, data)
 }
 
-// HasChunk reports whether a chunk with this hash already exists.
-func (b *LocalBackend) HasChunk(hash string) (bool, error) {
+func (b *LocalBackend) HasChunk(ctx context.Context, hash string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if err := safeKey(hash); err != nil {
 		return false, err
 	}
@@ -105,33 +104,40 @@ func (b *LocalBackend) HasChunk(hash string) (bool, error) {
 	return false, err
 }
 
-// GetChunk returns the data stored under hash.
-func (b *LocalBackend) GetChunk(hash string) ([]byte, error) {
+func (b *LocalBackend) GetChunk(ctx context.Context, hash string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := safeKey(hash); err != nil {
 		return nil, err
 	}
 	return os.ReadFile(b.chunkPath(hash))
 }
 
-// PutSnapshot stores a serialized manifest under id. Snapshot ids are unique
-// per backup, so this never overwrites an existing manifest.
-func (b *LocalBackend) PutSnapshot(id string, data []byte) error {
+func (b *LocalBackend) PutSnapshot(ctx context.Context, id string, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := safeKey(id); err != nil {
 		return err
 	}
 	return writeFileAtomic(b.snapshotPath(id), data)
 }
 
-// GetSnapshot returns the serialized manifest stored under id.
-func (b *LocalBackend) GetSnapshot(id string) ([]byte, error) {
+func (b *LocalBackend) GetSnapshot(ctx context.Context, id string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := safeKey(id); err != nil {
 		return nil, err
 	}
 	return os.ReadFile(b.snapshotPath(id))
 }
 
-// ListSnapshots returns the ids (without the .json suffix) of all snapshots.
-func (b *LocalBackend) ListSnapshots() ([]string, error) {
+func (b *LocalBackend) ListSnapshots(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(filepath.Join(b.root, "snapshots"))
 	if err != nil {
 		return nil, err

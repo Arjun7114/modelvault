@@ -43,14 +43,13 @@ type BackupStats struct {
 	StoredBytes int64
 }
 
-// storeChunk records one hashed chunk serially (used by the serial Backup):
-// updates stats and the manifest, then stores the chunk only if new.
-func (e *Engine) storeChunk(snap *snapshot.Snapshot, stats *BackupStats, hash string, data []byte) error {
+// storeChunk records one hashed chunk serially (used by the serial Backup).
+func (e *Engine) storeChunk(ctx context.Context, snap *snapshot.Snapshot, stats *BackupStats, hash string, data []byte) error {
 	stats.TotalChunks++
 	stats.TotalBytes += int64(len(data))
 	snap.Chunks = append(snap.Chunks, hash)
 
-	has, err := e.backend.HasChunk(hash)
+	has, err := e.backend.HasChunk(ctx, hash)
 	if err != nil {
 		return fmt.Errorf("checking chunk %s: %w", hash, err)
 	}
@@ -58,7 +57,7 @@ func (e *Engine) storeChunk(snap *snapshot.Snapshot, stats *BackupStats, hash st
 		stats.DupChunks++
 		return nil
 	}
-	if err := e.backend.PutChunk(hash, data); err != nil {
+	if err := e.backend.PutChunk(ctx, hash, data); err != nil {
 		return fmt.Errorf("storing chunk %s: %w", hash, err)
 	}
 	stats.NewChunks++
@@ -67,7 +66,7 @@ func (e *Engine) storeChunk(snap *snapshot.Snapshot, stats *BackupStats, hash st
 }
 
 // finalize sets the snapshot size, assigns it an id, serializes it, and stores it.
-func (e *Engine) finalize(snap *snapshot.Snapshot, totalBytes int64) error {
+func (e *Engine) finalize(ctx context.Context, snap *snapshot.Snapshot, totalBytes int64) error {
 	snap.Size = totalBytes
 	id, err := newSnapshotID()
 	if err != nil {
@@ -78,7 +77,7 @@ func (e *Engine) finalize(snap *snapshot.Snapshot, totalBytes int64) error {
 	if err != nil {
 		return fmt.Errorf("serializing snapshot: %w", err)
 	}
-	if err := e.backend.PutSnapshot(id, data); err != nil {
+	if err := e.backend.PutSnapshot(ctx, id, data); err != nil {
 		return fmt.Errorf("storing snapshot: %w", err)
 	}
 	return nil
@@ -86,33 +85,27 @@ func (e *Engine) finalize(snap *snapshot.Snapshot, totalBytes int64) error {
 
 // Backup reads all of r, splits it into chunks, stores the chunks it hasn't
 // seen before, and writes a snapshot manifest. This is the serial path.
-func (e *Engine) Backup(source string, r io.Reader) (*snapshot.Snapshot, BackupStats, error) {
+func (e *Engine) Backup(ctx context.Context, source string, r io.Reader) (*snapshot.Snapshot, BackupStats, error) {
 	var stats BackupStats
 	snap := &snapshot.Snapshot{Source: source, CreatedAt: time.Now().UTC()}
 
 	err := e.chunker.Split(r, func(chunk []byte) error {
 		sum := sha256.Sum256(chunk)
-		return e.storeChunk(snap, &stats, hex.EncodeToString(sum[:]), chunk)
+		return e.storeChunk(ctx, snap, &stats, hex.EncodeToString(sum[:]), chunk)
 	})
 	if err != nil {
 		return nil, stats, err
 	}
 
-	if err := e.finalize(snap, stats.TotalBytes); err != nil {
+	if err := e.finalize(ctx, snap, stats.TotalBytes); err != nil {
 		return nil, stats, err
 	}
 	return snap, stats, nil
 }
 
-// BackupConcurrent runs a three-stage pipeline coordinated by an errgroup:
-//
-//	producer -> [hash workers] -> collector -> [store workers]
-//
-// If any stage returns an error, or ctx is cancelled, the shared context is
-// cancelled and every stage stops promptly; Wait returns the first error.
-// Hashing is fanned out (CPU-bound); storing uses a bounded pool (I/O-bound);
-// the collector reorders by index and dispatches each unique chunk once, so
-// stats come out identical to the serial Backup.
+// BackupConcurrent runs a three-stage pipeline (producer -> hashers -> collector
+// -> store pool) coordinated by an errgroup. Cancellation and errors propagate
+// through gctx; stats come out identical to the serial Backup.
 func (e *Engine) BackupConcurrent(ctx context.Context, source string, r io.Reader, workers int) (*snapshot.Snapshot, BackupStats, error) {
 	if workers < 1 {
 		workers = 1
@@ -138,28 +131,27 @@ func (e *Engine) BackupConcurrent(ctx context.Context, source string, r io.Reade
 	results := make(chan hashed, workers)
 	storeJobs := make(chan storeJob, workers)
 
-	g, ctx := errgroup.WithContext(ctx)
+	g, gctx := errgroup.WithContext(ctx)
 
 	// Producer: split into ordered, indexed chunks, honoring cancellation.
 	g.Go(func() error {
 		defer close(jobs)
 		i := 0
 		return e.chunker.Split(r, func(chunk []byte) error {
-			if err := ctx.Err(); err != nil {
+			if err := gctx.Err(); err != nil {
 				return err
 			}
 			select {
 			case jobs <- job{index: i, data: chunk}:
 				i++
 				return nil
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-gctx.Done():
+				return gctx.Err()
 			}
 		})
 	})
 
-	// Fan-out hashers (CPU-bound). A WaitGroup lets us close results once all
-	// hashers have finished — errgroup handles errors, not channel lifecycle.
+	// Fan-out hashers (CPU-bound). WaitGroup lets us close results when done.
 	var wgHash sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wgHash.Add(1)
@@ -169,8 +161,8 @@ func (e *Engine) BackupConcurrent(ctx context.Context, source string, r io.Reade
 				sum := sha256.Sum256(j.data)
 				select {
 				case results <- hashed{index: j.index, hash: hex.EncodeToString(sum[:]), data: j.data}:
-				case <-ctx.Done():
-					return ctx.Err()
+				case <-gctx.Done():
+					return gctx.Err()
 				}
 			}
 			return nil
@@ -210,20 +202,19 @@ func (e *Engine) BackupConcurrent(ctx context.Context, source string, r io.Reade
 				seen[cur.hash] = true
 				select {
 				case storeJobs <- storeJob{hash: cur.hash, data: cur.data}:
-				case <-ctx.Done():
-					return ctx.Err()
+				case <-gctx.Done():
+					return gctx.Err()
 				}
 			}
 		}
 		return nil
 	})
 
-	// Bounded store pool (I/O-bound). Each unique hash is dispatched once, so
-	// workers never race on the same hash; counters are atomic.
+	// Bounded store pool (I/O-bound). Each unique hash is dispatched once.
 	for w := 0; w < workers; w++ {
 		g.Go(func() error {
 			for sj := range storeJobs {
-				has, err := e.backend.HasChunk(sj.hash)
+				has, err := e.backend.HasChunk(gctx, sj.hash)
 				if err != nil {
 					return fmt.Errorf("checking chunk %s: %w", sj.hash, err)
 				}
@@ -231,7 +222,7 @@ func (e *Engine) BackupConcurrent(ctx context.Context, source string, r io.Reade
 					atomic.AddInt64(&dupCross, 1)
 					continue
 				}
-				if err := e.backend.PutChunk(sj.hash, sj.data); err != nil {
+				if err := e.backend.PutChunk(gctx, sj.hash, sj.data); err != nil {
 					return fmt.Errorf("storing chunk %s: %w", sj.hash, err)
 				}
 				atomic.AddInt64(&newChunks, 1)
@@ -249,7 +240,8 @@ func (e *Engine) BackupConcurrent(ctx context.Context, source string, r io.Reade
 	stats.DupChunks = dupWithin + int(dupCross)
 	stats.StoredBytes = storedBytes
 
-	if err := e.finalize(snap, stats.TotalBytes); err != nil {
+	// Use the original ctx here: gctx is already cancelled once Wait returns.
+	if err := e.finalize(ctx, snap, stats.TotalBytes); err != nil {
 		return nil, stats, err
 	}
 	return snap, stats, nil
@@ -273,12 +265,11 @@ type RestoreStats struct {
 }
 
 // Restore reads the snapshot with the given id and writes its reconstructed
-// contents to w, in chunk order. Every chunk is re-hashed and checked against
-// its stored address before being written, so corruption is caught on read.
-func (e *Engine) Restore(snapshotID string, w io.Writer) (RestoreStats, error) {
+// contents to w, in chunk order, verifying each chunk's hash on the way out.
+func (e *Engine) Restore(ctx context.Context, snapshotID string, w io.Writer) (RestoreStats, error) {
 	var stats RestoreStats
 
-	data, err := e.backend.GetSnapshot(snapshotID)
+	data, err := e.backend.GetSnapshot(ctx, snapshotID)
 	if err != nil {
 		return stats, fmt.Errorf("reading snapshot: %w", err)
 	}
@@ -288,7 +279,7 @@ func (e *Engine) Restore(snapshotID string, w io.Writer) (RestoreStats, error) {
 	}
 
 	for i, hash := range snap.Chunks {
-		chunk, err := e.backend.GetChunk(hash)
+		chunk, err := e.backend.GetChunk(ctx, hash)
 		if err != nil {
 			return stats, fmt.Errorf("reading chunk %d (%s): %w", i, hash, err)
 		}
@@ -308,17 +299,16 @@ func (e *Engine) Restore(snapshotID string, w io.Writer) (RestoreStats, error) {
 	}
 	return stats, nil
 }
+
 // RestoreConcurrent is like Restore, but fetches and verifies chunks across
-// `workers` goroutines (I/O-bound), then writes them to w in index order via a
-// single collector — so the output is identical to Restore. Cancellation and
-// errors propagate through the errgroup, same as BackupConcurrent.
+// `workers` goroutines, then writes them in index order via a single collector.
 func (e *Engine) RestoreConcurrent(ctx context.Context, snapshotID string, w io.Writer, workers int) (RestoreStats, error) {
 	if workers < 1 {
 		workers = 1
 	}
 	var stats RestoreStats
 
-	data, err := e.backend.GetSnapshot(snapshotID)
+	data, err := e.backend.GetSnapshot(ctx, snapshotID)
 	if err != nil {
 		return stats, fmt.Errorf("reading snapshot: %w", err)
 	}
@@ -339,32 +329,30 @@ func (e *Engine) RestoreConcurrent(ctx context.Context, snapshotID string, w io.
 	jobs := make(chan job, workers)
 	results := make(chan fetched, workers)
 
-	g, ctx := errgroup.WithContext(ctx)
+	g, gctx := errgroup.WithContext(ctx)
 
-	// Producer: hand out chunk references in order.
 	g.Go(func() error {
 		defer close(jobs)
 		for i, h := range snap.Chunks {
-			if err := ctx.Err(); err != nil {
+			if err := gctx.Err(); err != nil {
 				return err
 			}
 			select {
 			case jobs <- job{index: i, hash: h}:
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-gctx.Done():
+				return gctx.Err()
 			}
 		}
 		return nil
 	})
 
-	// Fan-out: fetch each chunk and verify its hash in parallel.
 	var wgFetch sync.WaitGroup
 	for wk := 0; wk < workers; wk++ {
 		wgFetch.Add(1)
 		g.Go(func() error {
 			defer wgFetch.Done()
 			for j := range jobs {
-				chunk, err := e.backend.GetChunk(j.hash)
+				chunk, err := e.backend.GetChunk(gctx, j.hash)
 				if err != nil {
 					return fmt.Errorf("reading chunk %d (%s): %w", j.index, j.hash, err)
 				}
@@ -374,8 +362,8 @@ func (e *Engine) RestoreConcurrent(ctx context.Context, snapshotID string, w io.
 				}
 				select {
 				case results <- fetched{index: j.index, data: chunk}:
-				case <-ctx.Done():
-					return ctx.Err()
+				case <-gctx.Done():
+					return gctx.Err()
 				}
 			}
 			return nil
@@ -386,7 +374,6 @@ func (e *Engine) RestoreConcurrent(ctx context.Context, snapshotID string, w io.
 		close(results)
 	}()
 
-	// Collector: write chunks to w strictly in index order.
 	g.Go(func() error {
 		pending := make(map[int][]byte)
 		next := 0

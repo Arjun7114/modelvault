@@ -2,12 +2,14 @@ package backend_test
 
 import (
 	"bytes"
+	"context"
 	"testing"
 
 	"github.com/Arjun7114/modelvault/internal/backend"
 )
 
 func TestLocalBackend_ChunkRoundTrip(t *testing.T) {
+	ctx := context.Background()
 	b, err := backend.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocal: %v", err)
@@ -15,17 +17,17 @@ func TestLocalBackend_ChunkRoundTrip(t *testing.T) {
 
 	hash, data := "deadbeef", []byte("hello chunk")
 
-	if ok, err := b.HasChunk(hash); err != nil || ok {
+	if ok, err := b.HasChunk(ctx, hash); err != nil || ok {
 		t.Fatalf("HasChunk before put = (%v, %v), want (false, nil)", ok, err)
 	}
-	if err := b.PutChunk(hash, data); err != nil {
+	if err := b.PutChunk(ctx, hash, data); err != nil {
 		t.Fatalf("PutChunk: %v", err)
 	}
-	if ok, err := b.HasChunk(hash); err != nil || !ok {
+	if ok, err := b.HasChunk(ctx, hash); err != nil || !ok {
 		t.Fatalf("HasChunk after put = (%v, %v), want (true, nil)", ok, err)
 	}
 
-	got, err := b.GetChunk(hash)
+	got, err := b.GetChunk(ctx, hash)
 	if err != nil {
 		t.Fatalf("GetChunk: %v", err)
 	}
@@ -33,22 +35,22 @@ func TestLocalBackend_ChunkRoundTrip(t *testing.T) {
 		t.Errorf("GetChunk = %q, want %q", got, data)
 	}
 
-	// Putting the same hash again is a successful no-op (dedup).
-	if err := b.PutChunk(hash, data); err != nil {
+	if err := b.PutChunk(ctx, hash, data); err != nil {
 		t.Errorf("second PutChunk returned error: %v", err)
 	}
 }
 
 func TestLocalBackend_Snapshots(t *testing.T) {
+	ctx := context.Background()
 	b, err := backend.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocal: %v", err)
 	}
 
-	if err := b.PutSnapshot("snap1", []byte(`{"id":"snap1"}`)); err != nil {
+	if err := b.PutSnapshot(ctx, "snap1", []byte(`{"id":"snap1"}`)); err != nil {
 		t.Fatalf("PutSnapshot: %v", err)
 	}
-	got, err := b.GetSnapshot("snap1")
+	got, err := b.GetSnapshot(ctx, "snap1")
 	if err != nil {
 		t.Fatalf("GetSnapshot: %v", err)
 	}
@@ -56,7 +58,7 @@ func TestLocalBackend_Snapshots(t *testing.T) {
 		t.Errorf("GetSnapshot = %q", got)
 	}
 
-	ids, err := b.ListSnapshots()
+	ids, err := b.ListSnapshots(ctx)
 	if err != nil {
 		t.Fatalf("ListSnapshots: %v", err)
 	}
@@ -66,11 +68,12 @@ func TestLocalBackend_Snapshots(t *testing.T) {
 }
 
 func TestLocalBackend_RejectsUnsafeKey(t *testing.T) {
+	ctx := context.Background()
 	b, err := backend.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewLocal: %v", err)
 	}
-	if err := b.PutChunk("../escape", []byte("x")); err == nil {
+	if err := b.PutChunk(ctx, "../escape", []byte("x")); err == nil {
 		t.Error("expected error for unsafe key, got nil")
 	}
 }

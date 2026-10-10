@@ -19,21 +19,19 @@ func makeBytes(n int, seed int64) []byte {
 	return b
 }
 
-// The concurrent path must produce byte-for-byte the same manifest and stored
-// chunks as the serial path — same hashes, same order, same stats.
 func TestBackupConcurrent_MatchesSerial(t *testing.T) {
+	ctx := context.Background()
 	data := makeBytes(100_000, 99)
 
 	beA, _ := backend.NewLocal(t.TempDir())
-	snapA, statsA, err := engine.New(chunker.NewFixed(1024), beA).
-		Backup("x", bytes.NewReader(data))
+	snapA, statsA, err := engine.New(chunker.NewFixed(1024), beA).Backup(ctx, "x", bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("serial: %v", err)
 	}
 
 	beB, _ := backend.NewLocal(t.TempDir())
 	snapB, statsB, err := engine.New(chunker.NewFixed(1024), beB).
-		BackupConcurrent(context.Background(), "x", bytes.NewReader(data), 8)
+		BackupConcurrent(ctx, "x", bytes.NewReader(data), 8)
 	if err != nil {
 		t.Fatalf("concurrent: %v", err)
 	}
@@ -52,19 +50,19 @@ func TestBackupConcurrent_MatchesSerial(t *testing.T) {
 	}
 }
 
-// A concurrent backup must still restore byte-for-byte.
 func TestBackupConcurrent_RoundTrip(t *testing.T) {
+	ctx := context.Background()
 	be, _ := backend.NewLocal(t.TempDir())
 	eng := engine.New(chunker.NewFixed(1024), be)
 
 	original := makeBytes(50_000, 7)
-	snap, _, err := eng.BackupConcurrent(context.Background(), "x", bytes.NewReader(original), 8)
+	snap, _, err := eng.BackupConcurrent(ctx, "x", bytes.NewReader(original), 8)
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
 
 	var buf bytes.Buffer
-	if _, err := eng.Restore(snap.ID, &buf); err != nil {
+	if _, err := eng.Restore(ctx, snap.ID, &buf); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	if !bytes.Equal(buf.Bytes(), original) {
@@ -72,9 +70,8 @@ func TestBackupConcurrent_RoundTrip(t *testing.T) {
 	}
 }
 
-// With lots of repeated blocks, dedup counters are heavily exercised. The
-// concurrent path must produce identical stats and manifest to the serial path.
 func TestBackupConcurrent_DedupMatchesSerial_WithRepeats(t *testing.T) {
+	ctx := context.Background()
 	block := makeBytes(1024, 1)
 	var data []byte
 	for i := 0; i < 50; i++ {
@@ -83,14 +80,14 @@ func TestBackupConcurrent_DedupMatchesSerial_WithRepeats(t *testing.T) {
 	data = append(data, makeBytes(2048, 2)...)
 
 	beA, _ := backend.NewLocal(t.TempDir())
-	snapA, sA, err := engine.New(chunker.NewFixed(1024), beA).Backup("x", bytes.NewReader(data))
+	snapA, sA, err := engine.New(chunker.NewFixed(1024), beA).Backup(ctx, "x", bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("serial: %v", err)
 	}
 
 	beB, _ := backend.NewLocal(t.TempDir())
 	snapB, sB, err := engine.New(chunker.NewFixed(1024), beB).
-		BackupConcurrent(context.Background(), "x", bytes.NewReader(data), 8)
+		BackupConcurrent(ctx, "x", bytes.NewReader(data), 8)
 	if err != nil {
 		t.Fatalf("concurrent: %v", err)
 	}
@@ -108,13 +105,12 @@ func TestBackupConcurrent_DedupMatchesSerial_WithRepeats(t *testing.T) {
 	}
 }
 
-// A cancelled context must abort the backup and surface context.Canceled.
 func TestBackupConcurrent_Cancellation(t *testing.T) {
 	be, _ := backend.NewLocal(t.TempDir())
 	eng := engine.New(chunker.NewFixed(1024), be)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel before starting
+	cancel()
 
 	_, _, err := eng.BackupConcurrent(ctx, "x", bytes.NewReader(makeBytes(1_000_000, 5)), 8)
 	if err == nil {
@@ -124,19 +120,20 @@ func TestBackupConcurrent_Cancellation(t *testing.T) {
 		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }
-// A concurrent restore must reproduce the original bytes exactly.
+
 func TestRestoreConcurrent_RoundTrip(t *testing.T) {
+	ctx := context.Background()
 	be, _ := backend.NewLocal(t.TempDir())
 	eng := engine.New(chunker.NewFixed(1024), be)
 
 	original := makeBytes(80_000, 11)
-	snap, _, err := eng.BackupConcurrent(context.Background(), "x", bytes.NewReader(original), 8)
+	snap, _, err := eng.BackupConcurrent(ctx, "x", bytes.NewReader(original), 8)
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
 
 	var buf bytes.Buffer
-	stats, err := eng.RestoreConcurrent(context.Background(), snap.ID, &buf, 8)
+	stats, err := eng.RestoreConcurrent(ctx, snap.ID, &buf, 8)
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -148,7 +145,6 @@ func TestRestoreConcurrent_RoundTrip(t *testing.T) {
 	}
 }
 
-// A cancelled context must abort the restore and surface context.Canceled.
 func TestRestoreConcurrent_Cancellation(t *testing.T) {
 	be, _ := backend.NewLocal(t.TempDir())
 	eng := engine.New(chunker.NewFixed(1024), be)

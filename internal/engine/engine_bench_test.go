@@ -14,8 +14,7 @@ import (
 )
 
 // memBackend is an in-memory, thread-safe Backend used to isolate CPU cost
-// (hashing) from disk I/O in benchmarks. That it's this small to implement is
-// itself a sign the Backend interface is well-factored.
+// (hashing) from disk I/O in benchmarks.
 type memBackend struct {
 	mu     sync.Mutex
 	chunks map[string][]byte
@@ -28,7 +27,7 @@ func newMemBackend() *memBackend {
 	return &memBackend{chunks: map[string][]byte{}, snaps: map[string][]byte{}}
 }
 
-func (m *memBackend) PutChunk(hash string, data []byte) error {
+func (m *memBackend) PutChunk(ctx context.Context, hash string, data []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.chunks[hash]; !ok {
@@ -39,14 +38,14 @@ func (m *memBackend) PutChunk(hash string, data []byte) error {
 	return nil
 }
 
-func (m *memBackend) HasChunk(hash string) (bool, error) {
+func (m *memBackend) HasChunk(ctx context.Context, hash string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_, ok := m.chunks[hash]
 	return ok, nil
 }
 
-func (m *memBackend) GetChunk(hash string) ([]byte, error) {
+func (m *memBackend) GetChunk(ctx context.Context, hash string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d, ok := m.chunks[hash]
@@ -58,14 +57,14 @@ func (m *memBackend) GetChunk(hash string) ([]byte, error) {
 	return cp, nil
 }
 
-func (m *memBackend) PutSnapshot(id string, data []byte) error {
+func (m *memBackend) PutSnapshot(ctx context.Context, id string, data []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.snaps[id] = data
 	return nil
 }
 
-func (m *memBackend) GetSnapshot(id string) ([]byte, error) {
+func (m *memBackend) GetSnapshot(ctx context.Context, id string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	d, ok := m.snaps[id]
@@ -75,7 +74,7 @@ func (m *memBackend) GetSnapshot(id string) ([]byte, error) {
 	return d, nil
 }
 
-func (m *memBackend) ListSnapshots() ([]string, error) {
+func (m *memBackend) ListSnapshots(ctx context.Context) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ids := make([]string, 0, len(m.snaps))
@@ -86,20 +85,20 @@ func (m *memBackend) ListSnapshots() ([]string, error) {
 }
 
 func benchmarkBackup(b *testing.B, concurrent bool, workers int) {
-	data := makeBytes(8<<20, 123) // 8 MiB of unique data
-	b.SetBytes(int64(len(data)))  // lets Go report MB/s
+	data := makeBytes(8<<20, 123)
+	b.SetBytes(int64(len(data)))
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		be := newMemBackend() // fresh each iteration so nothing dedups away
+		be := newMemBackend()
 		eng := engine.New(chunker.NewFixed(4096), be)
 
 		var err error
 		if concurrent {
 			_, _, err = eng.BackupConcurrent(context.Background(), "x", bytes.NewReader(data), workers)
 		} else {
-			_, _, err = eng.Backup("x", bytes.NewReader(data))
+			_, _, err = eng.Backup(context.Background(), "x", bytes.NewReader(data))
 		}
 		if err != nil {
 			b.Fatal(err)

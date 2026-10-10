@@ -4,23 +4,25 @@
 // then S3 and Azure Blob behind this same interface.
 package backend
 
+import "context"
+
 // Backend stores and retrieves content-addressed chunks and snapshot
-// manifests. Every method returns an error so remote implementations
-// (with network failures) fit the same contract as the local one.
+// manifests. Every method takes a context.Context so cloud implementations
+// (S3, Azure Blob) honor cancellation and deadlines; the local disk backend
+// checks it too, for consistency.
 type Backend interface {
 	// PutChunk stores data under hash. It must be idempotent: storing a
 	// hash that already exists is a successful no-op.
-	PutChunk(hash string, data []byte) error
+	PutChunk(ctx context.Context, hash string, data []byte) error
 	// HasChunk reports whether a chunk with this hash already exists.
-	// The engine uses it to skip re-storing duplicate chunks.
-	HasChunk(hash string) (bool, error)
+	HasChunk(ctx context.Context, hash string) (bool, error)
 	// GetChunk returns the data previously stored under hash.
-	GetChunk(hash string) ([]byte, error)
+	GetChunk(ctx context.Context, hash string) ([]byte, error)
 
 	// PutSnapshot stores a serialized snapshot manifest under id.
-	PutSnapshot(id string, data []byte) error
+	PutSnapshot(ctx context.Context, id string, data []byte) error
 	// GetSnapshot returns the serialized manifest stored under id.
-	GetSnapshot(id string) ([]byte, error)
+	GetSnapshot(ctx context.Context, id string) ([]byte, error)
 	// ListSnapshots returns the ids of all stored snapshots.
-	ListSnapshots() ([]string, error)
+	ListSnapshots(ctx context.Context) ([]string, error)
 }
