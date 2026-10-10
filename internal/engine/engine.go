@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/Arjun7114/modelvault/internal/backend"
@@ -38,60 +39,157 @@ type BackupStats struct {
 	StoredBytes int64
 }
 
+// storeChunk records one hashed chunk: it updates stats and the manifest, then
+// stores the chunk only if the backend doesn't already have it (dedup). It is
+// called serially (by Backup directly, or by BackupConcurrent's collector in
+// chunk order), so it needs no locking.
+func (e *Engine) storeChunk(snap *snapshot.Snapshot, stats *BackupStats, hash string, data []byte) error {
+	stats.TotalChunks++
+	stats.TotalBytes += int64(len(data))
+	snap.Chunks = append(snap.Chunks, hash)
+
+	has, err := e.backend.HasChunk(hash)
+	if err != nil {
+		return fmt.Errorf("checking chunk %s: %w", hash, err)
+	}
+	if has {
+		stats.DupChunks++
+		return nil
+	}
+	if err := e.backend.PutChunk(hash, data); err != nil {
+		return fmt.Errorf("storing chunk %s: %w", hash, err)
+	}
+	stats.NewChunks++
+	stats.StoredBytes += int64(len(data))
+	return nil
+}
+
+// finalize sets the snapshot size, assigns it an id, serializes it, and stores it.
+func (e *Engine) finalize(snap *snapshot.Snapshot, totalBytes int64) error {
+	snap.Size = totalBytes
+	id, err := newSnapshotID()
+	if err != nil {
+		return fmt.Errorf("generating snapshot id: %w", err)
+	}
+	snap.ID = id
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return fmt.Errorf("serializing snapshot: %w", err)
+	}
+	if err := e.backend.PutSnapshot(id, data); err != nil {
+		return fmt.Errorf("storing snapshot: %w", err)
+	}
+	return nil
+}
+
 // Backup reads all of r, splits it into chunks, stores the chunks it hasn't
-// seen before, and writes a snapshot manifest. source is a human-readable
-// label (e.g. the original file path) recorded in the manifest.
+// seen before, and writes a snapshot manifest. This is the serial path.
 func (e *Engine) Backup(source string, r io.Reader) (*snapshot.Snapshot, BackupStats, error) {
 	var stats BackupStats
-	snap := &snapshot.Snapshot{
-		Source:    source,
-		CreatedAt: time.Now().UTC(),
-	}
+	snap := &snapshot.Snapshot{Source: source, CreatedAt: time.Now().UTC()}
 
 	err := e.chunker.Split(r, func(chunk []byte) error {
-		// The chunk's SHA-256, in hex, IS its address.
 		sum := sha256.Sum256(chunk)
-		hash := hex.EncodeToString(sum[:])
-
-		stats.TotalChunks++
-		stats.TotalBytes += int64(len(chunk))
-		snap.Chunks = append(snap.Chunks, hash)
-
-		has, err := e.backend.HasChunk(hash)
-		if err != nil {
-			return fmt.Errorf("checking chunk %s: %w", hash, err)
-		}
-		if has {
-			stats.DupChunks++
-			return nil // already stored: de-duplicated
-		}
-		if err := e.backend.PutChunk(hash, chunk); err != nil {
-			return fmt.Errorf("storing chunk %s: %w", hash, err)
-		}
-		stats.NewChunks++
-		stats.StoredBytes += int64(len(chunk))
-		return nil
+		return e.storeChunk(snap, &stats, hex.EncodeToString(sum[:]), chunk)
 	})
 	if err != nil {
 		return nil, stats, err
 	}
 
-	snap.Size = stats.TotalBytes
-
-	id, err := newSnapshotID()
-	if err != nil {
-		return nil, stats, fmt.Errorf("generating snapshot id: %w", err)
+	if err := e.finalize(snap, stats.TotalBytes); err != nil {
+		return nil, stats, err
 	}
-	snap.ID = id
+	return snap, stats, nil
+}
 
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return nil, stats, fmt.Errorf("serializing snapshot: %w", err)
+// BackupConcurrent is like Backup, but hashes chunks across `workers` goroutines
+// (fan-out), then reassembles the results in order (fan-in) before storing them.
+// Storing itself is still serial here; a bounded store pool comes in Phase 3.2.
+func (e *Engine) BackupConcurrent(source string, r io.Reader, workers int) (*snapshot.Snapshot, BackupStats, error) {
+	if workers < 1 {
+		workers = 1
 	}
-	if err := e.backend.PutSnapshot(id, data); err != nil {
-		return nil, stats, fmt.Errorf("storing snapshot: %w", err)
+	var stats BackupStats
+	snap := &snapshot.Snapshot{Source: source, CreatedAt: time.Now().UTC()}
+
+	type job struct {
+		index int
+		data  []byte
+	}
+	type result struct {
+		index int
+		hash  string
+		data  []byte
 	}
 
+	jobs := make(chan job, workers)
+	results := make(chan result, workers)
+
+	// Producer: split into chunks and feed the hashers, tagging each with its
+	// position so the collector can restore order later. The chunker hands us a
+	// fresh slice per chunk, so passing data across goroutines is safe.
+	var splitErr error
+	go func() {
+		i := 0
+		splitErr = e.chunker.Split(r, func(chunk []byte) error {
+			jobs <- job{index: i, data: chunk}
+			i++
+			return nil
+		})
+		close(jobs)
+	}()
+
+	// Fan-out: each worker hashes chunks in parallel (SHA-256 is CPU-bound).
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				sum := sha256.Sum256(j.data)
+				results <- result{index: j.index, hash: hex.EncodeToString(sum[:]), data: j.data}
+			}
+		}()
+	}
+
+	// Fan-in: close results once every hasher has finished.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collector: buffer out-of-order results in a map and emit them in index
+	// order, so the manifest lists chunks exactly as they appeared in the file.
+	pending := make(map[int]result)
+	next := 0
+	var storeErr error
+	for res := range results {
+		pending[res.index] = res
+		for {
+			cur, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, next)
+			next++
+			if storeErr != nil {
+				continue // already failed; keep draining so goroutines don't leak
+			}
+			if err := e.storeChunk(snap, &stats, cur.hash, cur.data); err != nil {
+				storeErr = err
+			}
+		}
+	}
+
+	if splitErr != nil {
+		return nil, stats, splitErr
+	}
+	if storeErr != nil {
+		return nil, stats, storeErr
+	}
+	if err := e.finalize(snap, stats.TotalBytes); err != nil {
+		return nil, stats, err
+	}
 	return snap, stats, nil
 }
 
@@ -105,6 +203,7 @@ func newSnapshotID() (string, error) {
 	ts := time.Now().UTC().Format("20060102T150405Z")
 	return fmt.Sprintf("%s-%s", ts, hex.EncodeToString(b[:])), nil
 }
+
 // RestoreStats summarizes a restore.
 type RestoreStats struct {
 	Chunks int
@@ -131,7 +230,6 @@ func (e *Engine) Restore(snapshotID string, w io.Writer) (RestoreStats, error) {
 		if err != nil {
 			return stats, fmt.Errorf("reading chunk %d (%s): %w", i, hash, err)
 		}
-		// Integrity: the bytes must still hash to their own address.
 		sum := sha256.Sum256(chunk)
 		if got := hex.EncodeToString(sum[:]); got != hash {
 			return stats, fmt.Errorf("integrity error on chunk %d: want %s, got %s", i, hash, got)
