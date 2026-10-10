@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -21,7 +22,8 @@ func newTestServer(t *testing.T) *httptest.Server {
 		t.Fatal(err)
 	}
 	eng := engine.New(chunker.NewFixed(1024), be)
-	return httptest.NewServer(api.NewServer(eng).Routes())
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil)) // silent in tests
+	return httptest.NewServer(api.NewServer(eng, logger).Routes())
 }
 
 func TestAPI_BackupListRestore(t *testing.T) {

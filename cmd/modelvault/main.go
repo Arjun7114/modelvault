@@ -9,6 +9,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"time"
+	"log/slog"
+	
 
 	"github.com/Arjun7114/modelvault/internal/api"
 	"github.com/Arjun7114/modelvault/internal/backend"
@@ -223,7 +225,6 @@ func runRestore(ctx context.Context, args []string) error {
 	fmt.Printf("  chunks: %d (%d bytes)\n", stats.Chunks, stats.Bytes)
 	return nil
 }
-
 func runServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	kind, vault, bucket, region, container := addBackendFlags(fs)
@@ -233,6 +234,8 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
 	be, err := buildBackend(ctx, *kind, *vault, *bucket, *region, *container)
 	if err != nil {
 		return err
@@ -241,18 +244,18 @@ func runServe(ctx context.Context, args []string) error {
 
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: api.NewServer(eng).Routes(),
+		Handler: api.NewServer(eng, logger).Routes(),
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		fmt.Printf("modelvault serving on %s (backend: %s)\n", *addr, *kind)
+		logger.Info("server starting", "addr", *addr, "backend", *kind)
 		errCh <- srv.ListenAndServe()
 	}()
 
 	select {
 	case <-ctx.Done():
-		fmt.Println("\nshutting down...")
+		logger.Info("shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
