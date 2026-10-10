@@ -308,3 +308,112 @@ func (e *Engine) Restore(snapshotID string, w io.Writer) (RestoreStats, error) {
 	}
 	return stats, nil
 }
+// RestoreConcurrent is like Restore, but fetches and verifies chunks across
+// `workers` goroutines (I/O-bound), then writes them to w in index order via a
+// single collector — so the output is identical to Restore. Cancellation and
+// errors propagate through the errgroup, same as BackupConcurrent.
+func (e *Engine) RestoreConcurrent(ctx context.Context, snapshotID string, w io.Writer, workers int) (RestoreStats, error) {
+	if workers < 1 {
+		workers = 1
+	}
+	var stats RestoreStats
+
+	data, err := e.backend.GetSnapshot(snapshotID)
+	if err != nil {
+		return stats, fmt.Errorf("reading snapshot: %w", err)
+	}
+	var snap snapshot.Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return stats, fmt.Errorf("parsing snapshot: %w", err)
+	}
+
+	type job struct {
+		index int
+		hash  string
+	}
+	type fetched struct {
+		index int
+		data  []byte
+	}
+
+	jobs := make(chan job, workers)
+	results := make(chan fetched, workers)
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	// Producer: hand out chunk references in order.
+	g.Go(func() error {
+		defer close(jobs)
+		for i, h := range snap.Chunks {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			select {
+			case jobs <- job{index: i, hash: h}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	})
+
+	// Fan-out: fetch each chunk and verify its hash in parallel.
+	var wgFetch sync.WaitGroup
+	for wk := 0; wk < workers; wk++ {
+		wgFetch.Add(1)
+		g.Go(func() error {
+			defer wgFetch.Done()
+			for j := range jobs {
+				chunk, err := e.backend.GetChunk(j.hash)
+				if err != nil {
+					return fmt.Errorf("reading chunk %d (%s): %w", j.index, j.hash, err)
+				}
+				sum := sha256.Sum256(chunk)
+				if got := hex.EncodeToString(sum[:]); got != j.hash {
+					return fmt.Errorf("integrity error on chunk %d: want %s, got %s", j.index, j.hash, got)
+				}
+				select {
+				case results <- fetched{index: j.index, data: chunk}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		})
+	}
+	go func() {
+		wgFetch.Wait()
+		close(results)
+	}()
+
+	// Collector: write chunks to w strictly in index order.
+	g.Go(func() error {
+		pending := make(map[int][]byte)
+		next := 0
+		for res := range results {
+			pending[res.index] = res.data
+			for {
+				chunk, ok := pending[next]
+				if !ok {
+					break
+				}
+				delete(pending, next)
+				if _, err := w.Write(chunk); err != nil {
+					return fmt.Errorf("writing chunk %d: %w", next, err)
+				}
+				stats.Chunks++
+				stats.Bytes += int64(len(chunk))
+				next++
+			}
+		}
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return stats, err
+	}
+	if stats.Bytes != snap.Size {
+		return stats, fmt.Errorf("size mismatch: snapshot says %d bytes, restored %d", snap.Size, stats.Bytes)
+	}
+	return stats, nil
+}

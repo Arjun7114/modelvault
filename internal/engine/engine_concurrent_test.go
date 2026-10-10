@@ -124,3 +124,48 @@ func TestBackupConcurrent_Cancellation(t *testing.T) {
 		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }
+// A concurrent restore must reproduce the original bytes exactly.
+func TestRestoreConcurrent_RoundTrip(t *testing.T) {
+	be, _ := backend.NewLocal(t.TempDir())
+	eng := engine.New(chunker.NewFixed(1024), be)
+
+	original := makeBytes(80_000, 11)
+	snap, _, err := eng.BackupConcurrent(context.Background(), "x", bytes.NewReader(original), 8)
+	if err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	var buf bytes.Buffer
+	stats, err := eng.RestoreConcurrent(context.Background(), snap.ID, &buf, 8)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), original) {
+		t.Errorf("round-trip mismatch: got %d bytes, want %d", buf.Len(), len(original))
+	}
+	if stats.Bytes != int64(len(original)) {
+		t.Errorf("restored %d bytes, want %d", stats.Bytes, len(original))
+	}
+}
+
+// A cancelled context must abort the restore and surface context.Canceled.
+func TestRestoreConcurrent_Cancellation(t *testing.T) {
+	be, _ := backend.NewLocal(t.TempDir())
+	eng := engine.New(chunker.NewFixed(1024), be)
+
+	snap, _, err := eng.BackupConcurrent(context.Background(), "x", bytes.NewReader(makeBytes(200_000, 3)), 8)
+	if err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = eng.RestoreConcurrent(ctx, snap.ID, &bytes.Buffer{}, 8)
+	if err == nil {
+		t.Fatal("expected a cancellation error, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
