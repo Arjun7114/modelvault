@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Arjun7114/modelvault/internal/backend"
@@ -39,10 +40,8 @@ type BackupStats struct {
 	StoredBytes int64
 }
 
-// storeChunk records one hashed chunk: it updates stats and the manifest, then
-// stores the chunk only if the backend doesn't already have it (dedup). It is
-// called serially (by Backup directly, or by BackupConcurrent's collector in
-// chunk order), so it needs no locking.
+// storeChunk records one hashed chunk serially (used by the serial Backup):
+// updates stats and the manifest, then stores the chunk only if new.
 func (e *Engine) storeChunk(snap *snapshot.Snapshot, stats *BackupStats, hash string, data []byte) error {
 	stats.TotalChunks++
 	stats.TotalBytes += int64(len(data))
@@ -102,9 +101,15 @@ func (e *Engine) Backup(source string, r io.Reader) (*snapshot.Snapshot, BackupS
 	return snap, stats, nil
 }
 
-// BackupConcurrent is like Backup, but hashes chunks across `workers` goroutines
-// (fan-out), then reassembles the results in order (fan-in) before storing them.
-// Storing itself is still serial here; a bounded store pool comes in Phase 3.2.
+// BackupConcurrent runs a three-stage pipeline:
+//
+//	producer -> [hash workers] -> collector -> [store workers]
+//
+// Hashing is fanned out across `workers` goroutines (CPU-bound). The collector
+// reorders results by index so the manifest stays correct, and dispatches each
+// UNIQUE chunk once to a bounded pool of store workers (I/O-bound). The bounded
+// storeJobs channel provides end-to-end backpressure. Stats come out identical
+// to the serial Backup.
 func (e *Engine) BackupConcurrent(source string, r io.Reader, workers int) (*snapshot.Snapshot, BackupStats, error) {
 	if workers < 1 {
 		workers = 1
@@ -116,18 +121,21 @@ func (e *Engine) BackupConcurrent(source string, r io.Reader, workers int) (*sna
 		index int
 		data  []byte
 	}
-	type result struct {
+	type hashed struct {
 		index int
 		hash  string
 		data  []byte
 	}
+	type storeJob struct {
+		hash string
+		data []byte
+	}
 
 	jobs := make(chan job, workers)
-	results := make(chan result, workers)
+	results := make(chan hashed, workers)
+	storeJobs := make(chan storeJob, workers) // bounded: the backpressure valve
 
-	// Producer: split into chunks and feed the hashers, tagging each with its
-	// position so the collector can restore order later. The chunker hands us a
-	// fresh slice per chunk, so passing data across goroutines is safe.
+	// Producer: split into ordered, indexed chunks.
 	var splitErr error
 	go func() {
 		i := 0
@@ -139,30 +147,69 @@ func (e *Engine) BackupConcurrent(source string, r io.Reader, workers int) (*sna
 		close(jobs)
 	}()
 
-	// Fan-out: each worker hashes chunks in parallel (SHA-256 is CPU-bound).
-	var wg sync.WaitGroup
+	// Fan-out: hash chunks in parallel.
+	var wgHash sync.WaitGroup
 	for w := 0; w < workers; w++ {
-		wg.Add(1)
+		wgHash.Add(1)
 		go func() {
-			defer wg.Done()
+			defer wgHash.Done()
 			for j := range jobs {
 				sum := sha256.Sum256(j.data)
-				results <- result{index: j.index, hash: hex.EncodeToString(sum[:]), data: j.data}
+				results <- hashed{index: j.index, hash: hex.EncodeToString(sum[:]), data: j.data}
+			}
+		}()
+	}
+	go func() {
+		wgHash.Wait()
+		close(results)
+	}()
+
+	// Store pool: bounded workers do the I/O. Each unique hash is dispatched
+	// exactly once (the collector guarantees it), so workers never race on the
+	// same hash; counters are atomic because different hashes store concurrently.
+	var newChunks, dupCross, storedBytes int64
+	var muErr sync.Mutex
+	var storeErr error
+	setErr := func(err error) {
+		muErr.Lock()
+		if storeErr == nil {
+			storeErr = err
+		}
+		muErr.Unlock()
+	}
+
+	var wgStore sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wgStore.Add(1)
+		go func() {
+			defer wgStore.Done()
+			for sj := range storeJobs {
+				has, err := e.backend.HasChunk(sj.hash)
+				if err != nil {
+					setErr(fmt.Errorf("checking chunk %s: %w", sj.hash, err))
+					continue
+				}
+				if has {
+					atomic.AddInt64(&dupCross, 1)
+					continue
+				}
+				if err := e.backend.PutChunk(sj.hash, sj.data); err != nil {
+					setErr(fmt.Errorf("storing chunk %s: %w", sj.hash, err))
+					continue
+				}
+				atomic.AddInt64(&newChunks, 1)
+				atomic.AddInt64(&storedBytes, int64(len(sj.data)))
 			}
 		}()
 	}
 
-	// Fan-in: close results once every hasher has finished.
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Collector: buffer out-of-order results in a map and emit them in index
-	// order, so the manifest lists chunks exactly as they appeared in the file.
-	pending := make(map[int]result)
+	// Collector (this goroutine): reorder by index, build the manifest, and
+	// dispatch each unique chunk to the store pool. Within-run duplicates are
+	// counted here and never dispatched — keeping stats identical to serial.
+	pending := make(map[int]hashed)
+	seen := make(map[string]bool)
 	next := 0
-	var storeErr error
+	dupWithin := 0
 	for res := range results {
 		pending[res.index] = res
 		for {
@@ -172,14 +219,21 @@ func (e *Engine) BackupConcurrent(source string, r io.Reader, workers int) (*sna
 			}
 			delete(pending, next)
 			next++
-			if storeErr != nil {
-				continue // already failed; keep draining so goroutines don't leak
+
+			stats.TotalChunks++
+			stats.TotalBytes += int64(len(cur.data))
+			snap.Chunks = append(snap.Chunks, cur.hash)
+
+			if seen[cur.hash] {
+				dupWithin++
+				continue
 			}
-			if err := e.storeChunk(snap, &stats, cur.hash, cur.data); err != nil {
-				storeErr = err
-			}
+			seen[cur.hash] = true
+			storeJobs <- storeJob{hash: cur.hash, data: cur.data} // may block -> backpressure
 		}
 	}
+	close(storeJobs)
+	wgStore.Wait()
 
 	if splitErr != nil {
 		return nil, stats, splitErr
@@ -187,6 +241,11 @@ func (e *Engine) BackupConcurrent(source string, r io.Reader, workers int) (*sna
 	if storeErr != nil {
 		return nil, stats, storeErr
 	}
+
+	stats.NewChunks = int(newChunks)
+	stats.DupChunks = dupWithin + int(dupCross)
+	stats.StoredBytes = storedBytes
+
 	if err := e.finalize(snap, stats.TotalBytes); err != nil {
 		return nil, stats, err
 	}

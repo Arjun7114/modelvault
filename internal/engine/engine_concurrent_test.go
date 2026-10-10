@@ -69,3 +69,37 @@ func TestBackupConcurrent_RoundTrip(t *testing.T) {
 		t.Errorf("round-trip mismatch: got %d bytes, want %d", buf.Len(), len(original))
 	}
 }
+// With lots of repeated blocks, dedup counters are heavily exercised. The
+// concurrent path must produce identical stats and manifest to the serial path.
+func TestBackupConcurrent_DedupMatchesSerial_WithRepeats(t *testing.T) {
+	block := makeBytes(1024, 1)
+	var data []byte
+	for i := 0; i < 50; i++ {
+		data = append(data, block...) // the same 1 KiB block, 50 times
+	}
+	data = append(data, makeBytes(2048, 2)...) // plus a unique tail
+
+	beA, _ := backend.NewLocal(t.TempDir())
+	snapA, sA, err := engine.New(chunker.NewFixed(1024), beA).Backup("x", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("serial: %v", err)
+	}
+
+	beB, _ := backend.NewLocal(t.TempDir())
+	snapB, sB, err := engine.New(chunker.NewFixed(1024), beB).BackupConcurrent("x", bytes.NewReader(data), 8)
+	if err != nil {
+		t.Fatalf("concurrent: %v", err)
+	}
+
+	if sA != sB {
+		t.Errorf("stats differ:\n  serial     %+v\n  concurrent %+v", sA, sB)
+	}
+	if len(snapA.Chunks) != len(snapB.Chunks) {
+		t.Fatalf("chunk count: serial %d, concurrent %d", len(snapA.Chunks), len(snapB.Chunks))
+	}
+	for i := range snapA.Chunks {
+		if snapA.Chunks[i] != snapB.Chunks[i] {
+			t.Fatalf("chunk %d differs", i)
+		}
+	}
+}
