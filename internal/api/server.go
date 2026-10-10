@@ -7,6 +7,9 @@ import (
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/Arjun7114/modelvault/internal/engine"
 )
 
@@ -35,7 +38,6 @@ func (s *Server) Routes() http.Handler {
 	return s.logging(mux)
 }
 
-// logging wraps a handler, emitting one structured log line per request.
 func (s *Server) logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -52,7 +54,6 @@ func (s *Server) logging(next http.Handler) http.Handler {
 	})
 }
 
-// statusRecorder captures the status code and byte count for logging.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
@@ -75,22 +76,37 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	ctx, span := otel.Tracer("modelvault/api").Start(r.Context(), "backup")
+	defer span.End()
+
 	source := r.URL.Query().Get("source")
 	if source == "" {
 		source = "upload"
 	}
-	snap, stats, err := s.engine.Backup(r.Context(), source, r.Body)
+	span.SetAttributes(attribute.String("source", source))
+
+	snap, stats, err := s.engine.Backup(ctx, source, r.Body)
 	if err != nil {
+		span.RecordError(err)
 		s.logger.Error("backup failed", "source", source, "err", err)
 		httpError(w, http.StatusInternalServerError, err)
 		return
 	}
+	span.SetAttributes(
+		attribute.Int("chunks.total", stats.TotalChunks),
+		attribute.Int("chunks.new", stats.NewChunks),
+		attribute.Int64("bytes.total", stats.TotalBytes),
+	)
 	writeJSON(w, http.StatusCreated, map[string]any{"snapshot": snap, "stats": stats})
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	ids, err := s.engine.ListSnapshots(r.Context())
+	ctx, span := otel.Tracer("modelvault/api").Start(r.Context(), "list")
+	defer span.End()
+
+	ids, err := s.engine.ListSnapshots(ctx)
 	if err != nil {
+		span.RecordError(err)
 		s.logger.Error("list failed", "err", err)
 		httpError(w, http.StatusInternalServerError, err)
 		return
@@ -98,13 +114,19 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	if ids == nil {
 		ids = []string{}
 	}
+	span.SetAttributes(attribute.Int("snapshots.count", len(ids)))
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": ids})
 }
 
 func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
+	ctx, span := otel.Tracer("modelvault/api").Start(r.Context(), "restore")
+	defer span.End()
+
 	id := r.PathValue("id")
+	span.SetAttributes(attribute.String("snapshot.id", id))
 	w.Header().Set("Content-Type", "application/octet-stream")
-	if _, err := s.engine.Restore(r.Context(), id, w); err != nil {
+	if _, err := s.engine.Restore(ctx, id, w); err != nil {
+		span.RecordError(err)
 		s.logger.Error("restore failed", "id", id, "err", err)
 		httpError(w, http.StatusInternalServerError, err)
 		return

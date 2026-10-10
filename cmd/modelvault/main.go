@@ -10,12 +10,14 @@ import (
 	"path/filepath"
 	"time"
 	"log/slog"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	
 
 	"github.com/Arjun7114/modelvault/internal/api"
 	"github.com/Arjun7114/modelvault/internal/backend"
 	"github.com/Arjun7114/modelvault/internal/chunker"
 	"github.com/Arjun7114/modelvault/internal/engine"
+	"github.com/Arjun7114/modelvault/internal/observability"
 )
 
 func main() {
@@ -236,15 +238,26 @@ func runServe(ctx context.Context, args []string) error {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	shutdownTracer, err := observability.InitTracer(ctx, "modelvault")
+	if err != nil {
+		return fmt.Errorf("init tracing: %w", err)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownTracer(sctx)
+	}()
+
 	be, err := buildBackend(ctx, *kind, *vault, *bucket, *region, *container)
 	if err != nil {
 		return err
 	}
 	eng := engine.New(chunker.NewFixed(*chunkSize), be)
 
+	handler := otelhttp.NewHandler(api.NewServer(eng, logger).Routes(), "modelvault.http")
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: api.NewServer(eng, logger).Routes(),
+		Handler: handler,
 	}
 
 	errCh := make(chan error, 1)
