@@ -2,6 +2,8 @@ package engine_test
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"math/rand"
 	"testing"
 
@@ -17,8 +19,8 @@ func makeBytes(n int, seed int64) []byte {
 	return b
 }
 
-// The concurrent path must produce byte-for-byte the same manifest and the same
-// stored chunks as the serial path — same hashes, same order, same stats.
+// The concurrent path must produce byte-for-byte the same manifest and stored
+// chunks as the serial path — same hashes, same order, same stats.
 func TestBackupConcurrent_MatchesSerial(t *testing.T) {
 	data := makeBytes(100_000, 99)
 
@@ -31,7 +33,7 @@ func TestBackupConcurrent_MatchesSerial(t *testing.T) {
 
 	beB, _ := backend.NewLocal(t.TempDir())
 	snapB, statsB, err := engine.New(chunker.NewFixed(1024), beB).
-		BackupConcurrent("x", bytes.NewReader(data), 8)
+		BackupConcurrent(context.Background(), "x", bytes.NewReader(data), 8)
 	if err != nil {
 		t.Fatalf("concurrent: %v", err)
 	}
@@ -56,7 +58,7 @@ func TestBackupConcurrent_RoundTrip(t *testing.T) {
 	eng := engine.New(chunker.NewFixed(1024), be)
 
 	original := makeBytes(50_000, 7)
-	snap, _, err := eng.BackupConcurrent("x", bytes.NewReader(original), 8)
+	snap, _, err := eng.BackupConcurrent(context.Background(), "x", bytes.NewReader(original), 8)
 	if err != nil {
 		t.Fatalf("backup: %v", err)
 	}
@@ -69,15 +71,16 @@ func TestBackupConcurrent_RoundTrip(t *testing.T) {
 		t.Errorf("round-trip mismatch: got %d bytes, want %d", buf.Len(), len(original))
 	}
 }
+
 // With lots of repeated blocks, dedup counters are heavily exercised. The
 // concurrent path must produce identical stats and manifest to the serial path.
 func TestBackupConcurrent_DedupMatchesSerial_WithRepeats(t *testing.T) {
 	block := makeBytes(1024, 1)
 	var data []byte
 	for i := 0; i < 50; i++ {
-		data = append(data, block...) // the same 1 KiB block, 50 times
+		data = append(data, block...)
 	}
-	data = append(data, makeBytes(2048, 2)...) // plus a unique tail
+	data = append(data, makeBytes(2048, 2)...)
 
 	beA, _ := backend.NewLocal(t.TempDir())
 	snapA, sA, err := engine.New(chunker.NewFixed(1024), beA).Backup("x", bytes.NewReader(data))
@@ -86,7 +89,8 @@ func TestBackupConcurrent_DedupMatchesSerial_WithRepeats(t *testing.T) {
 	}
 
 	beB, _ := backend.NewLocal(t.TempDir())
-	snapB, sB, err := engine.New(chunker.NewFixed(1024), beB).BackupConcurrent("x", bytes.NewReader(data), 8)
+	snapB, sB, err := engine.New(chunker.NewFixed(1024), beB).
+		BackupConcurrent(context.Background(), "x", bytes.NewReader(data), 8)
 	if err != nil {
 		t.Fatalf("concurrent: %v", err)
 	}
@@ -101,5 +105,22 @@ func TestBackupConcurrent_DedupMatchesSerial_WithRepeats(t *testing.T) {
 		if snapA.Chunks[i] != snapB.Chunks[i] {
 			t.Fatalf("chunk %d differs", i)
 		}
+	}
+}
+
+// A cancelled context must abort the backup and surface context.Canceled.
+func TestBackupConcurrent_Cancellation(t *testing.T) {
+	be, _ := backend.NewLocal(t.TempDir())
+	eng := engine.New(chunker.NewFixed(1024), be)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before starting
+
+	_, _, err := eng.BackupConcurrent(ctx, "x", bytes.NewReader(makeBytes(1_000_000, 5)), 8)
+	if err == nil {
+		t.Fatal("expected a cancellation error, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }

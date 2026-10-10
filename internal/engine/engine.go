@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/Arjun7114/modelvault/internal/backend"
 	"github.com/Arjun7114/modelvault/internal/chunker"
@@ -101,16 +104,16 @@ func (e *Engine) Backup(source string, r io.Reader) (*snapshot.Snapshot, BackupS
 	return snap, stats, nil
 }
 
-// BackupConcurrent runs a three-stage pipeline:
+// BackupConcurrent runs a three-stage pipeline coordinated by an errgroup:
 //
 //	producer -> [hash workers] -> collector -> [store workers]
 //
-// Hashing is fanned out across `workers` goroutines (CPU-bound). The collector
-// reorders results by index so the manifest stays correct, and dispatches each
-// UNIQUE chunk once to a bounded pool of store workers (I/O-bound). The bounded
-// storeJobs channel provides end-to-end backpressure. Stats come out identical
-// to the serial Backup.
-func (e *Engine) BackupConcurrent(source string, r io.Reader, workers int) (*snapshot.Snapshot, BackupStats, error) {
+// If any stage returns an error, or ctx is cancelled, the shared context is
+// cancelled and every stage stops promptly; Wait returns the first error.
+// Hashing is fanned out (CPU-bound); storing uses a bounded pool (I/O-bound);
+// the collector reorders by index and dispatches each unique chunk once, so
+// stats come out identical to the serial Backup.
+func (e *Engine) BackupConcurrent(ctx context.Context, source string, r io.Reader, workers int) (*snapshot.Snapshot, BackupStats, error) {
 	if workers < 1 {
 		workers = 1
 	}
@@ -133,113 +136,113 @@ func (e *Engine) BackupConcurrent(source string, r io.Reader, workers int) (*sna
 
 	jobs := make(chan job, workers)
 	results := make(chan hashed, workers)
-	storeJobs := make(chan storeJob, workers) // bounded: the backpressure valve
+	storeJobs := make(chan storeJob, workers)
 
-	// Producer: split into ordered, indexed chunks.
-	var splitErr error
-	go func() {
+	g, ctx := errgroup.WithContext(ctx)
+
+	// Producer: split into ordered, indexed chunks, honoring cancellation.
+	g.Go(func() error {
+		defer close(jobs)
 		i := 0
-		splitErr = e.chunker.Split(r, func(chunk []byte) error {
-			jobs <- job{index: i, data: chunk}
-			i++
-			return nil
+		return e.chunker.Split(r, func(chunk []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			select {
+			case jobs <- job{index: i, data: chunk}:
+				i++
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		})
-		close(jobs)
-	}()
+	})
 
-	// Fan-out: hash chunks in parallel.
+	// Fan-out hashers (CPU-bound). A WaitGroup lets us close results once all
+	// hashers have finished — errgroup handles errors, not channel lifecycle.
 	var wgHash sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wgHash.Add(1)
-		go func() {
+		g.Go(func() error {
 			defer wgHash.Done()
 			for j := range jobs {
 				sum := sha256.Sum256(j.data)
-				results <- hashed{index: j.index, hash: hex.EncodeToString(sum[:]), data: j.data}
+				select {
+				case results <- hashed{index: j.index, hash: hex.EncodeToString(sum[:]), data: j.data}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
-		}()
+			return nil
+		})
 	}
 	go func() {
 		wgHash.Wait()
 		close(results)
 	}()
 
-	// Store pool: bounded workers do the I/O. Each unique hash is dispatched
-	// exactly once (the collector guarantees it), so workers never race on the
-	// same hash; counters are atomic because different hashes store concurrently.
+	// Collector: reorder by index, build the manifest, dispatch unique chunks.
 	var newChunks, dupCross, storedBytes int64
-	var muErr sync.Mutex
-	var storeErr error
-	setErr := func(err error) {
-		muErr.Lock()
-		if storeErr == nil {
-			storeErr = err
-		}
-		muErr.Unlock()
-	}
+	var dupWithin int
+	g.Go(func() error {
+		defer close(storeJobs)
+		pending := make(map[int]hashed)
+		seen := make(map[string]bool)
+		next := 0
+		for res := range results {
+			pending[res.index] = res
+			for {
+				cur, ok := pending[next]
+				if !ok {
+					break
+				}
+				delete(pending, next)
+				next++
 
-	var wgStore sync.WaitGroup
+				stats.TotalChunks++
+				stats.TotalBytes += int64(len(cur.data))
+				snap.Chunks = append(snap.Chunks, cur.hash)
+
+				if seen[cur.hash] {
+					dupWithin++
+					continue
+				}
+				seen[cur.hash] = true
+				select {
+				case storeJobs <- storeJob{hash: cur.hash, data: cur.data}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+		return nil
+	})
+
+	// Bounded store pool (I/O-bound). Each unique hash is dispatched once, so
+	// workers never race on the same hash; counters are atomic.
 	for w := 0; w < workers; w++ {
-		wgStore.Add(1)
-		go func() {
-			defer wgStore.Done()
+		g.Go(func() error {
 			for sj := range storeJobs {
 				has, err := e.backend.HasChunk(sj.hash)
 				if err != nil {
-					setErr(fmt.Errorf("checking chunk %s: %w", sj.hash, err))
-					continue
+					return fmt.Errorf("checking chunk %s: %w", sj.hash, err)
 				}
 				if has {
 					atomic.AddInt64(&dupCross, 1)
 					continue
 				}
 				if err := e.backend.PutChunk(sj.hash, sj.data); err != nil {
-					setErr(fmt.Errorf("storing chunk %s: %w", sj.hash, err))
-					continue
+					return fmt.Errorf("storing chunk %s: %w", sj.hash, err)
 				}
 				atomic.AddInt64(&newChunks, 1)
 				atomic.AddInt64(&storedBytes, int64(len(sj.data)))
 			}
-		}()
+			return nil
+		})
 	}
 
-	// Collector (this goroutine): reorder by index, build the manifest, and
-	// dispatch each unique chunk to the store pool. Within-run duplicates are
-	// counted here and never dispatched — keeping stats identical to serial.
-	pending := make(map[int]hashed)
-	seen := make(map[string]bool)
-	next := 0
-	dupWithin := 0
-	for res := range results {
-		pending[res.index] = res
-		for {
-			cur, ok := pending[next]
-			if !ok {
-				break
-			}
-			delete(pending, next)
-			next++
-
-			stats.TotalChunks++
-			stats.TotalBytes += int64(len(cur.data))
-			snap.Chunks = append(snap.Chunks, cur.hash)
-
-			if seen[cur.hash] {
-				dupWithin++
-				continue
-			}
-			seen[cur.hash] = true
-			storeJobs <- storeJob{hash: cur.hash, data: cur.data} // may block -> backpressure
-		}
-	}
-	close(storeJobs)
-	wgStore.Wait()
-
-	if splitErr != nil {
-		return nil, stats, splitErr
-	}
-	if storeErr != nil {
-		return nil, stats, storeErr
+	if err := g.Wait(); err != nil {
+		return nil, stats, err
 	}
 
 	stats.NewChunks = int(newChunks)
