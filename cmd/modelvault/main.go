@@ -43,15 +43,49 @@ func fail(err error) {
 func usage() {
 	fmt.Fprintln(os.Stderr, "modelvault: content-addressed backup for ML model artifacts")
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  modelvault backup  [--vault DIR] [--chunk-size N] <file>")
+	fmt.Fprintln(os.Stderr, "  modelvault backup  [--vault DIR] [--chunker fixed|cdc] [--chunk-size N] <file>")
 	fmt.Fprintln(os.Stderr, "  modelvault list    [--vault DIR]")
 	fmt.Fprintln(os.Stderr, "  modelvault restore [--vault DIR] --out FILE <snapshot-id>")
+}
+
+// buildChunker constructs the chosen chunking strategy. For cdc, chunk-size
+// seeds the parameters: average target 2^floor(log2(size)), min = size/4,
+// max = size*4 — so "fixed" and "cdc" at the same --chunk-size are comparable.
+func buildChunker(kind string, chunkSize int) (chunker.Chunker, error) {
+	switch kind {
+	case "fixed":
+		return chunker.NewFixed(chunkSize), nil
+	case "cdc":
+		avgBits := log2Floor(chunkSize)
+		if avgBits < 1 {
+			avgBits = 1
+		}
+		min := chunkSize / 4
+		if min < 1 {
+			min = 1
+		}
+		max := chunkSize * 4
+		return chunker.NewCDC(min, avgBits, max)
+	default:
+		return nil, fmt.Errorf("unknown chunker %q (want \"fixed\" or \"cdc\")", kind)
+	}
+}
+
+// log2Floor returns the position of the highest set bit (floor of log2).
+func log2Floor(n int) int {
+	bits := 0
+	for n > 1 {
+		n >>= 1
+		bits++
+	}
+	return bits
 }
 
 func runBackup(args []string) error {
 	fs := flag.NewFlagSet("backup", flag.ExitOnError)
 	vault := fs.String("vault", "vault", "path to the vault directory")
-	chunkSize := fs.Int("chunk-size", 4096, "chunk size in bytes")
+	chunkerKind := fs.String("chunker", "fixed", "chunking strategy: fixed or cdc")
+	chunkSize := fs.Int("chunk-size", 4096, "chunk size in bytes (fixed) / average target (cdc)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -59,6 +93,11 @@ func runBackup(args []string) error {
 		return fmt.Errorf("expected exactly one file to back up, got %d", fs.NArg())
 	}
 	srcPath := fs.Arg(0)
+
+	ck, err := buildChunker(*chunkerKind, *chunkSize)
+	if err != nil {
+		return err
+	}
 
 	f, err := os.Open(srcPath)
 	if err != nil {
@@ -70,14 +109,14 @@ func runBackup(args []string) error {
 	if err != nil {
 		return fmt.Errorf("opening vault: %w", err)
 	}
-	eng := engine.New(chunker.NewFixed(*chunkSize), be)
+	eng := engine.New(ck, be)
 
 	snap, stats, err := eng.Backup(filepath.Clean(srcPath), f)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("backed up %q\n", srcPath)
+	fmt.Printf("backed up %q (chunker: %s)\n", srcPath, *chunkerKind)
 	fmt.Printf("  snapshot:     %s\n", snap.ID)
 	fmt.Printf("  total chunks: %d (%d bytes)\n", stats.TotalChunks, stats.TotalBytes)
 	fmt.Printf("  new chunks:   %d (%d bytes stored)\n", stats.NewChunks, stats.StoredBytes)
@@ -128,7 +167,6 @@ func runRestore(args []string) error {
 	if err != nil {
 		return fmt.Errorf("opening vault: %w", err)
 	}
-	// Restore does not use a chunker, so we pass nil.
 	eng := engine.New(nil, be)
 
 	f, err := os.Create(*out)
