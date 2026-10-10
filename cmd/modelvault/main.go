@@ -49,21 +49,29 @@ func fail(err error) {
 func usage() {
 	fmt.Fprintln(os.Stderr, "modelvault: content-addressed backup for ML model artifacts")
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  modelvault backup  [--backend local|s3] [--vault DIR] [--bucket NAME] [--region R] [--chunker fixed|cdc] [--chunk-size N] <file>")
-	fmt.Fprintln(os.Stderr, "  modelvault list    [--backend local|s3] [--vault DIR] [--bucket NAME] [--region R]")
-	fmt.Fprintln(os.Stderr, "  modelvault restore [--backend local|s3] [--vault DIR] [--bucket NAME] [--region R] --out FILE <snapshot-id>")
+	fmt.Fprintln(os.Stderr, "  modelvault backup  [--backend local|s3|azure] [--vault DIR] [--bucket NAME] [--region R] [--container NAME] [--chunker fixed|cdc] [--chunk-size N] <file>")
+	fmt.Fprintln(os.Stderr, "  modelvault list    [--backend local|s3|azure] [--vault DIR] [--bucket NAME] [--region R] [--container NAME]")
+	fmt.Fprintln(os.Stderr, "  modelvault restore [--backend local|s3|azure] [--vault DIR] [--bucket NAME] [--region R] [--container NAME] --out FILE <snapshot-id>")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "azure backend reads the connection string from AZURE_STORAGE_CONNECTION_STRING.")
 }
 
-// buildBackend constructs the chosen storage backend. Adding Azure later is one
-// more case here — the engine never changes.
-func buildBackend(ctx context.Context, kind, vault, bucket, region string) (backend.Backend, error) {
+// buildBackend constructs the chosen storage backend. Three cloud/local options,
+// one interface — the engine never changes.
+func buildBackend(ctx context.Context, kind, vault, bucket, region, container string) (backend.Backend, error) {
 	switch kind {
 	case "local":
 		return backend.NewLocal(vault)
 	case "s3":
 		return backend.NewS3(ctx, bucket, region)
+	case "azure":
+		conn := os.Getenv("AZURE_STORAGE_CONNECTION_STRING")
+		if conn == "" {
+			return nil, fmt.Errorf("set AZURE_STORAGE_CONNECTION_STRING for --backend azure")
+		}
+		return backend.NewAzure(conn, container)
 	default:
-		return nil, fmt.Errorf("unknown backend %q (want \"local\" or \"s3\")", kind)
+		return nil, fmt.Errorf("unknown backend %q (want local, s3, or azure)", kind)
 	}
 }
 
@@ -96,12 +104,19 @@ func log2Floor(n int) int {
 	return bits
 }
 
+// addBackendFlags registers the backend-selection flags shared by all commands.
+func addBackendFlags(fs *flag.FlagSet) (kind, vault, bucket, region, container *string) {
+	kind = fs.String("backend", "local", "storage backend: local, s3, or azure")
+	vault = fs.String("vault", "vault", "path to the vault directory (local backend)")
+	bucket = fs.String("bucket", "", "S3 bucket name (s3 backend)")
+	region = fs.String("region", "", "S3 region (s3 backend; default from AWS config)")
+	container = fs.String("container", "modelvault", "Azure container name (azure backend)")
+	return
+}
+
 func runBackup(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("backup", flag.ExitOnError)
-	backendKind := fs.String("backend", "local", "storage backend: local or s3")
-	vault := fs.String("vault", "vault", "path to the vault directory (local backend)")
-	bucket := fs.String("bucket", "", "S3 bucket name (s3 backend)")
-	region := fs.String("region", "", "S3 region (s3 backend; default from AWS config)")
+	kind, vault, bucket, region, container := addBackendFlags(fs)
 	chunkerKind := fs.String("chunker", "fixed", "chunking strategy: fixed or cdc")
 	chunkSize := fs.Int("chunk-size", 4096, "chunk size in bytes (fixed) / average target (cdc)")
 	if err := fs.Parse(args); err != nil {
@@ -123,7 +138,7 @@ func runBackup(ctx context.Context, args []string) error {
 	}
 	defer f.Close()
 
-	be, err := buildBackend(ctx, *backendKind, *vault, *bucket, *region)
+	be, err := buildBackend(ctx, *kind, *vault, *bucket, *region, *container)
 	if err != nil {
 		return err
 	}
@@ -134,7 +149,7 @@ func runBackup(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("backed up %q (backend: %s, chunker: %s)\n", srcPath, *backendKind, *chunkerKind)
+	fmt.Printf("backed up %q (backend: %s, chunker: %s)\n", srcPath, *kind, *chunkerKind)
 	fmt.Printf("  snapshot:     %s\n", snap.ID)
 	fmt.Printf("  total chunks: %d (%d bytes)\n", stats.TotalChunks, stats.TotalBytes)
 	fmt.Printf("  new chunks:   %d (%d bytes stored)\n", stats.NewChunks, stats.StoredBytes)
@@ -144,15 +159,12 @@ func runBackup(ctx context.Context, args []string) error {
 
 func runList(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	backendKind := fs.String("backend", "local", "storage backend: local or s3")
-	vault := fs.String("vault", "vault", "path to the vault directory (local backend)")
-	bucket := fs.String("bucket", "", "S3 bucket name (s3 backend)")
-	region := fs.String("region", "", "S3 region (s3 backend)")
+	kind, vault, bucket, region, container := addBackendFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	be, err := buildBackend(ctx, *backendKind, *vault, *bucket, *region)
+	be, err := buildBackend(ctx, *kind, *vault, *bucket, *region, *container)
 	if err != nil {
 		return err
 	}
@@ -172,10 +184,7 @@ func runList(ctx context.Context, args []string) error {
 
 func runRestore(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
-	backendKind := fs.String("backend", "local", "storage backend: local or s3")
-	vault := fs.String("vault", "vault", "path to the vault directory (local backend)")
-	bucket := fs.String("bucket", "", "S3 bucket name (s3 backend)")
-	region := fs.String("region", "", "S3 region (s3 backend)")
+	kind, vault, bucket, region, container := addBackendFlags(fs)
 	out := fs.String("out", "", "output file path (required)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -188,7 +197,7 @@ func runRestore(ctx context.Context, args []string) error {
 	}
 	snapshotID := fs.Arg(0)
 
-	be, err := buildBackend(ctx, *backendKind, *vault, *bucket, *region)
+	be, err := buildBackend(ctx, *kind, *vault, *bucket, *region, *container)
 	if err != nil {
 		return err
 	}
@@ -205,7 +214,7 @@ func runRestore(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("restored snapshot %s -> %q (backend: %s)\n", snapshotID, *out, *backendKind)
+	fmt.Printf("restored snapshot %s -> %q (backend: %s)\n", snapshotID, *out, *kind)
 	fmt.Printf("  chunks: %d (%d bytes)\n", stats.Chunks, stats.Bytes)
 	return nil
 }
