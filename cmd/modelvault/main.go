@@ -19,8 +19,6 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Ctrl+C cancels the context, which propagates all the way down to the
-	// in-flight storage operations.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -51,9 +49,22 @@ func fail(err error) {
 func usage() {
 	fmt.Fprintln(os.Stderr, "modelvault: content-addressed backup for ML model artifacts")
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  modelvault backup  [--vault DIR] [--chunker fixed|cdc] [--chunk-size N] <file>")
-	fmt.Fprintln(os.Stderr, "  modelvault list    [--vault DIR]")
-	fmt.Fprintln(os.Stderr, "  modelvault restore [--vault DIR] --out FILE <snapshot-id>")
+	fmt.Fprintln(os.Stderr, "  modelvault backup  [--backend local|s3] [--vault DIR] [--bucket NAME] [--region R] [--chunker fixed|cdc] [--chunk-size N] <file>")
+	fmt.Fprintln(os.Stderr, "  modelvault list    [--backend local|s3] [--vault DIR] [--bucket NAME] [--region R]")
+	fmt.Fprintln(os.Stderr, "  modelvault restore [--backend local|s3] [--vault DIR] [--bucket NAME] [--region R] --out FILE <snapshot-id>")
+}
+
+// buildBackend constructs the chosen storage backend. Adding Azure later is one
+// more case here — the engine never changes.
+func buildBackend(ctx context.Context, kind, vault, bucket, region string) (backend.Backend, error) {
+	switch kind {
+	case "local":
+		return backend.NewLocal(vault)
+	case "s3":
+		return backend.NewS3(ctx, bucket, region)
+	default:
+		return nil, fmt.Errorf("unknown backend %q (want \"local\" or \"s3\")", kind)
+	}
 }
 
 func buildChunker(kind string, chunkSize int) (chunker.Chunker, error) {
@@ -87,7 +98,10 @@ func log2Floor(n int) int {
 
 func runBackup(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("backup", flag.ExitOnError)
-	vault := fs.String("vault", "vault", "path to the vault directory")
+	backendKind := fs.String("backend", "local", "storage backend: local or s3")
+	vault := fs.String("vault", "vault", "path to the vault directory (local backend)")
+	bucket := fs.String("bucket", "", "S3 bucket name (s3 backend)")
+	region := fs.String("region", "", "S3 region (s3 backend; default from AWS config)")
 	chunkerKind := fs.String("chunker", "fixed", "chunking strategy: fixed or cdc")
 	chunkSize := fs.Int("chunk-size", 4096, "chunk size in bytes (fixed) / average target (cdc)")
 	if err := fs.Parse(args); err != nil {
@@ -109,9 +123,9 @@ func runBackup(ctx context.Context, args []string) error {
 	}
 	defer f.Close()
 
-	be, err := backend.NewLocal(*vault)
+	be, err := buildBackend(ctx, *backendKind, *vault, *bucket, *region)
 	if err != nil {
-		return fmt.Errorf("opening vault: %w", err)
+		return err
 	}
 	eng := engine.New(ck, be)
 
@@ -120,7 +134,7 @@ func runBackup(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("backed up %q (chunker: %s)\n", srcPath, *chunkerKind)
+	fmt.Printf("backed up %q (backend: %s, chunker: %s)\n", srcPath, *backendKind, *chunkerKind)
 	fmt.Printf("  snapshot:     %s\n", snap.ID)
 	fmt.Printf("  total chunks: %d (%d bytes)\n", stats.TotalChunks, stats.TotalBytes)
 	fmt.Printf("  new chunks:   %d (%d bytes stored)\n", stats.NewChunks, stats.StoredBytes)
@@ -130,13 +144,17 @@ func runBackup(ctx context.Context, args []string) error {
 
 func runList(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	vault := fs.String("vault", "vault", "path to the vault directory")
+	backendKind := fs.String("backend", "local", "storage backend: local or s3")
+	vault := fs.String("vault", "vault", "path to the vault directory (local backend)")
+	bucket := fs.String("bucket", "", "S3 bucket name (s3 backend)")
+	region := fs.String("region", "", "S3 region (s3 backend)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	be, err := backend.NewLocal(*vault)
+
+	be, err := buildBackend(ctx, *backendKind, *vault, *bucket, *region)
 	if err != nil {
-		return fmt.Errorf("opening vault: %w", err)
+		return err
 	}
 	ids, err := be.ListSnapshots(ctx)
 	if err != nil {
@@ -154,7 +172,10 @@ func runList(ctx context.Context, args []string) error {
 
 func runRestore(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("restore", flag.ExitOnError)
-	vault := fs.String("vault", "vault", "path to the vault directory")
+	backendKind := fs.String("backend", "local", "storage backend: local or s3")
+	vault := fs.String("vault", "vault", "path to the vault directory (local backend)")
+	bucket := fs.String("bucket", "", "S3 bucket name (s3 backend)")
+	region := fs.String("region", "", "S3 region (s3 backend)")
 	out := fs.String("out", "", "output file path (required)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -167,9 +188,9 @@ func runRestore(ctx context.Context, args []string) error {
 	}
 	snapshotID := fs.Arg(0)
 
-	be, err := backend.NewLocal(*vault)
+	be, err := buildBackend(ctx, *backendKind, *vault, *bucket, *region)
 	if err != nil {
-		return fmt.Errorf("opening vault: %w", err)
+		return err
 	}
 	eng := engine.New(nil, be)
 
@@ -184,7 +205,7 @@ func runRestore(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("restored snapshot %s -> %q\n", snapshotID, *out)
+	fmt.Printf("restored snapshot %s -> %q (backend: %s)\n", snapshotID, *out, *backendKind)
 	fmt.Printf("  chunks: %d (%d bytes)\n", stats.Chunks, stats.Bytes)
 	return nil
 }
