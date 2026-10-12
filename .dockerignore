@@ -1,0 +1,5 @@
+.git/
+vault/
+restored_*
+*.exe
+*.bin
