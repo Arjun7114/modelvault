@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelvault
+  labels:
+    app: modelvault
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: modelvault
+  template:
+    metadata:
+      labels:
+        app: modelvault
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532        # distroless "nonroot" uid
+        fsGroup: 65532          # so the emptyDir is writable by nonroot
+      containers:
+        - name: modelvault
+          image: modelvault:dev
+          imagePullPolicy: IfNotPresent   # use the locally built image
+          args: ["serve", "--addr", ":8080", "--vault", "/data/vault"]
+          ports:
+            - name: http
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "500m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
