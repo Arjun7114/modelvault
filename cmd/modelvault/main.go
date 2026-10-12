@@ -248,6 +248,16 @@ func runServe(ctx context.Context, args []string) error {
 		_ = shutdownTracer(sctx)
 	}()
 
+	shutdownMeter, err := observability.InitMeter("modelvault")
+	if err != nil {
+		return fmt.Errorf("init metrics: %w", err)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownMeter(sctx)
+	}()
+
 	be, err := buildBackend(ctx, *kind, *vault, *bucket, *region, *container)
 	if err != nil {
 		return err
