@@ -1,0 +1,9 @@
+# Normalize line endings to LF in the repository (keeps shell scripts runnable
+# on Linux and stops the recurring "LF will be replaced by CRLF" warnings).
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
