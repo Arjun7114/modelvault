@@ -408,3 +408,38 @@ func (e *Engine) RestoreConcurrent(ctx context.Context, snapshotID string, w io.
 func (e *Engine) ListSnapshots(ctx context.Context) ([]string, error) {
 	return e.backend.ListSnapshots(ctx)
 }
+// VerifyStats summarizes a verification pass.
+type VerifyStats struct {
+	Chunks int
+	Bytes  int64
+}
+
+// Verify re-reads every chunk referenced by a snapshot and confirms each chunk's
+// content still hashes to its stored address — detecting corruption or missing
+// chunks without reconstructing the file.
+func (e *Engine) Verify(ctx context.Context, snapshotID string) (VerifyStats, error) {
+	var stats VerifyStats
+
+	data, err := e.backend.GetSnapshot(ctx, snapshotID)
+	if err != nil {
+		return stats, fmt.Errorf("reading snapshot: %w", err)
+	}
+	var snap snapshot.Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return stats, fmt.Errorf("parsing snapshot: %w", err)
+	}
+
+	for i, hash := range snap.Chunks {
+		chunk, err := e.backend.GetChunk(ctx, hash)
+		if err != nil {
+			return stats, fmt.Errorf("reading chunk %d (%s): %w", i, hash, err)
+		}
+		sum := sha256.Sum256(chunk)
+		if got := hex.EncodeToString(sum[:]); got != hash {
+			return stats, fmt.Errorf("integrity error on chunk %d: want %s, got %s", i, hash, got)
+		}
+		stats.Chunks++
+		stats.Bytes += int64(len(chunk))
+	}
+	return stats, nil
+}

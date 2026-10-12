@@ -46,8 +46,13 @@ func main() {
 		if err := runServe(ctx, os.Args[2:]); err != nil {
 			fail(err)
 		}
+	case "verify":
+		if err := runVerify(ctx, os.Args[2:]); err != nil {
+			fail(err)
+		}
 	default:
 		usage()
+		fmt.Fprintln(os.Stderr, "  modelvault verify  [--backend local|s3|azure] [--vault DIR] [--bucket NAME] [--region R] [--container NAME] [--all] [<snapshot-id>]")
 		os.Exit(2)
 	}
 }
@@ -225,6 +230,50 @@ func runRestore(ctx context.Context, args []string) error {
 
 	fmt.Printf("restored snapshot %s -> %q (backend: %s)\n", snapshotID, *out, *kind)
 	fmt.Printf("  chunks: %d (%d bytes)\n", stats.Chunks, stats.Bytes)
+	return nil
+}
+func runVerify(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("verify", flag.ExitOnError)
+	kind, vault, bucket, region, container := addBackendFlags(fs)
+	all := fs.Bool("all", false, "verify all snapshots")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	be, err := buildBackend(ctx, *kind, *vault, *bucket, *region, *container)
+	if err != nil {
+		return err
+	}
+	eng := engine.New(nil, be)
+
+	var ids []string
+	if *all || fs.NArg() == 0 {
+		ids, err = be.ListSnapshots(ctx)
+		if err != nil {
+			return err
+		}
+	} else {
+		ids = []string{fs.Arg(0)}
+	}
+	if len(ids) == 0 {
+		fmt.Println("no snapshots to verify")
+		return nil
+	}
+
+	failed := 0
+	for _, id := range ids {
+		stats, err := eng.Verify(ctx, id)
+		if err != nil {
+			fmt.Printf("FAIL %s: %v\n", id, err)
+			failed++
+			continue
+		}
+		fmt.Printf("OK   %s (%d chunks, %d bytes)\n", id, stats.Chunks, stats.Bytes)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d snapshots failed verification", failed, len(ids))
+	}
+	fmt.Printf("all %d snapshots verified\n", len(ids))
 	return nil
 }
 func runServe(ctx context.Context, args []string) error {
